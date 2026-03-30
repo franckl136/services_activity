@@ -1,3 +1,6 @@
+import hashlib
+import html
+import io
 import re
 import unicodedata
 import json
@@ -23,6 +26,11 @@ COLOR_SEQUENCE = (
     + px.colors.qualitative.Set2
     + px.colors.qualitative.Pastel
 )
+
+
+def fmt_fr(x: float, decimals: int = 2) -> str:
+    """Format nombre : espaces pour milliers, décimales fixes (lisibilité)."""
+    return f"{float(x):,.{decimals}f}".replace(",", " ")
 
 METADATA_NAMES = {
     "collaborateur",
@@ -104,24 +112,29 @@ def _column_name_is_date(name: str) -> bool:
     return bool(pd.notna(ts[0]))
 
 
-def detect_ticket_column(df: pd.DataFrame) -> Optional[str]:
-    for c in df.columns:
-        cl = str(c).lower().strip()
-        if "ticket" in cl and "id" in cl.replace(" ", ""):
-            return c
-        if cl in ("#", "id", "ticket id", "ticket_id"):
-            return c
-    return None
-
-
 def _is_excluded_column(name: str) -> bool:
     return str(name).lower().strip() in METADATA_NAMES
+
+
+def _is_reserved_data_column(name: str) -> bool:
+    """Colonnes qui ne sont pas des minutes par jour (métadonnées app, totaux export, etc.)."""
+    s = str(name).lower().strip()
+    if s in ("__ref_year", "_ref_year", "_fichier_source", "ref_year"):
+        return True
+    if s.startswith("_fichier"):
+        return True
+    # Totaux / cumuls souvent en fin de tableau (écrasent l’échelle des heatmaps)
+    if s in ("total", "totale", "totaux", "cumul", "grand total", "total annuel", "cumul annuel"):
+        return True
+    if re.match(r"^(total|somme|sum|cumul|subtotal)\b", s, re.I):
+        return True
+    return False
 
 
 def detect_date_columns(df: pd.DataFrame) -> list[str]:
     date_cols: list[str] = []
     for c in df.columns:
-        if _is_excluded_column(str(c)):
+        if _is_excluded_column(str(c)) or _is_reserved_data_column(str(c)):
             continue
         if _column_name_is_date(str(c)):
             date_cols.append(c)
@@ -129,9 +142,7 @@ def detect_date_columns(df: pd.DataFrame) -> list[str]:
     if date_cols:
         return date_cols
     for c in df.columns:
-        if _is_excluded_column(str(c)):
-            continue
-        if detect_ticket_column(df) == c:
+        if _is_excluded_column(str(c)) or _is_reserved_data_column(str(c)):
             continue
         if pd.api.types.is_numeric_dtype(df[c]):
             date_cols.append(c)
@@ -151,10 +162,315 @@ def build_total_temps(df: pd.DataFrame, date_cols: list[str]) -> pd.Series:
     return df[date_cols].sum(axis=1)
 
 
-def interventions_par_collaborateur(df: pd.DataFrame, col_ticket: Optional[str]) -> pd.Series:
-    if col_ticket and col_ticket in df.columns:
-        return df.groupby("Collaborateur", dropna=False)[col_ticket].nunique()
+def interventions_par_collaborateur(df: pd.DataFrame) -> pd.Series:
     return df.groupby("Collaborateur", dropna=False).size()
+
+
+def interventions_par_client(df: pd.DataFrame) -> pd.Series:
+    return df.groupby("Client", dropna=False).size()
+
+
+def build_client_executive_table(filtered: pd.DataFrame) -> pd.DataFrame:
+    """Classement clients : temps, lignes d’activité, charge relative (synthèse direction)."""
+    if filtered.empty or "Client" not in filtered.columns:
+        return pd.DataFrame()
+    temps = filtered.groupby("Client", dropna=False)["Total_Temps_Ticket"].sum()
+    inter = interventions_par_client(filtered)
+    inter = inter.reindex(temps.index, fill_value=0)
+    out = pd.DataFrame(
+        {
+            "Temps_total_min": temps,
+            "Nb_lignes": inter.astype(int),
+        }
+    )
+    out["Temps_moyen_par_ligne"] = out["Temps_total_min"] / out["Nb_lignes"].replace(0, pd.NA)
+    out = out.fillna(0.0)
+    tot = float(out["Temps_total_min"].sum())
+    if tot > 0:
+        out["Part_temps_pct"] = 100.0 * out["Temps_total_min"] / tot
+        out = out.sort_values("Temps_total_min", ascending=False)
+        out["Part_cumul_pct"] = out["Part_temps_pct"].cumsum()
+    else:
+        out["Part_temps_pct"] = 0.0
+        out["Part_cumul_pct"] = 0.0
+        out = out.sort_values("Temps_total_min", ascending=False)
+    out.insert(0, "Rang", range(1, len(out) + 1))
+    return out
+
+
+def detect_subject_column(df: pd.DataFrame) -> Optional[str]:
+    for c in df.columns:
+        cl = str(c).lower().strip()
+        if cl in ("sujet", "subject", "title", "titre", "résumé", "resume", "summary"):
+            return c
+    return None
+
+
+def categorie_from_sujet(text) -> str:
+    """Catégorie selon mots-clés dans le sujet (ordre : ADMIN, PARAM, TECH, sinon AUTRE)."""
+    if pd.isna(text):
+        return "AUTRE"
+    t = str(text).lower()
+    t = unicodedata.normalize("NFKD", t)
+    t = "".join(ch for ch in t if not unicodedata.combining(ch))
+    admin_kw = (
+        "mdp",
+        "session",
+        "connexion",
+        "acces",
+        "identifiant",
+        "profil",
+        "creation",
+        "cession",
+        "utilisateur",
+        "mot de passe",
+        "inacessible",
+        "inaccessible",
+    )
+    param_kw = (
+        "parametrage",
+        "cycle",
+        "regle",
+        "bdese",
+        "mutation",
+        "badge",
+        "badgeuse",
+        "calcul",
+        "analytique",
+        "pointage",
+    )
+    tech_kw = (
+        "erreur",
+        "fichier",
+        "extraction",
+        "rejet",
+        "bug",
+        "anomalie",
+        "systeme",
+        "integration",
+        "impossibilite",
+        "impossible",
+    )
+    for kw in admin_kw:
+        if kw in t:
+            return "ADMIN-ACCES"
+    for kw in param_kw:
+        if kw in t:
+            return "PARAM"
+    for kw in tech_kw:
+        if kw in t:
+            return "TECH"
+    return "AUTRE"
+
+
+def coef_categorie(cat: str) -> int:
+    return {"ADMIN-ACCES": 1, "PARAM": 2, "TECH": 3, "AUTRE": 1}.get(cat, 1)
+
+
+def enrich_complexity_columns(df: pd.DataFrame, subject_col: Optional[str]) -> pd.DataFrame:
+    """Ajoute Categorie, Coef_complexite, Score_Complexite (temps × coefficient)."""
+    out = df.copy()
+    if subject_col and subject_col in out.columns:
+        out["Categorie"] = out[subject_col].map(categorie_from_sujet)
+    else:
+        out["Categorie"] = "AUTRE"
+    out["Coef_complexite"] = out["Categorie"].map(coef_categorie)
+    out["Score_Complexite"] = pd.to_numeric(out["Total_Temps_Ticket"], errors="coerce").fillna(0) * out[
+        "Coef_complexite"
+    ]
+    return out
+
+
+def truncate_text(s: str, max_len: int = 40) -> str:
+    s = (s or "").strip()
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 1] + "…"
+
+
+def detect_ticket_column(df: pd.DataFrame) -> Optional[str]:
+    """Colonne identifiant ticket (priorité aux noms usuels)."""
+    priority = ("TICKET", "Ticket", "#", "ticket", "Ticket ID", "Ticket id", "ID ticket", "Id ticket")
+    for c in priority:
+        if c in df.columns:
+            return c
+    for c in df.columns:
+        cl = str(c).lower().strip()
+        if cl in ("ticket id", "ticket_id", "id ticket", "n° ticket", "no ticket", "numero ticket"):
+            return c
+    return None
+
+
+def build_complexity_treemap_hierarchy(
+    df: pd.DataFrame,
+    subject_col: Optional[str],
+    ticket_col: Optional[str],
+    sujet_truncate: int = 42,
+) -> pd.DataFrame:
+    """
+    Une ligne par feuille (catégorie × consultant × ticket) pour px.treemap path à 3 niveaux.
+    Libellé court sur la tuile ; détail complet via customdata (hover).
+    """
+    if df.empty or "Categorie" not in df.columns:
+        return pd.DataFrame()
+    base = df.copy()
+    if ticket_col and ticket_col in base.columns:
+        base["_tid"] = base[ticket_col].map(lambda x: str(x).strip() if pd.notna(x) else "")
+    else:
+        base["_tid"] = ""
+    empty_tid = base["_tid"].astype(str).str.len() == 0
+    if empty_tid.any():
+        # Numéro stable par ligne d'export si pas d'ID ticket
+        base.loc[empty_tid, "_tid"] = base.loc[empty_tid].index.map(lambda i: f"L{i+1}")
+
+    if subject_col and subject_col in base.columns:
+        base["_sujet"] = base[subject_col].fillna("").astype(str)
+    else:
+        base["_sujet"] = ""
+
+    g = (
+        base.groupby(["Categorie", "Collaborateur", "_tid"], dropna=False)
+        .agg(
+            Temps=("Total_Temps_Ticket", "sum"),
+            SC=("Score_Complexite", "sum"),
+            _sujet=("_sujet", "first"),
+        )
+        .reset_index()
+    )
+    g = g[g["Temps"] > 0]
+    if g.empty:
+        return g
+    g["Score_moy"] = (g["SC"] / g["Temps"]).fillna(0)
+    g["Ticket_label"] = g["_tid"].astype(str) + " — " + g["_sujet"].map(lambda s: truncate_text(s, sujet_truncate))
+    _dup = g.groupby(["Categorie", "Collaborateur", "Ticket_label"], dropna=False).cumcount()
+    _m = _dup > 0
+    if _m.any():
+        g.loc[_m, "Ticket_label"] = g.loc[_m, "Ticket_label"] + " (" + _dup[_m].astype(str) + ")"
+    return g
+
+
+def coloraxis_upper_for_outliers(
+    s: pd.Series,
+    q: float = 0.90,
+    tail_ratio: float = 1.06,
+) -> Optional[float]:
+    """
+    Plafond d'échelle continue pour limiter l'écrasement visuel par quelques outliers.
+    Si max ≤ quantile(q) × tail_ratio, renvoie None (échelle naturelle).
+    """
+    v = pd.to_numeric(s, errors="coerce").dropna()
+    if len(v) < 2:
+        return None
+    cap = float(v.quantile(q))
+    mx = float(v.max())
+    if mx <= cap * tail_ratio or cap <= 0:
+        return None
+    return cap
+
+
+def build_complexity_treemap_overview(df: pd.DataFrame) -> pd.DataFrame:
+    """Vue synthèse : catégorie × consultant (temps total, score moyen, temps moyen / ligne)."""
+    if df.empty or "Categorie" not in df.columns:
+        return pd.DataFrame()
+    g = (
+        df.groupby(["Categorie", "Collaborateur"], dropna=False)
+        .agg(
+            Temps=("Total_Temps_Ticket", "sum"),
+            SC=("Score_Complexite", "sum"),
+            Lignes=("Total_Temps_Ticket", "size"),
+        )
+        .reset_index()
+    )
+    g = g[g["Temps"] > 0]
+    if g.empty:
+        return g
+    g["Score_moy"] = (g["SC"] / g["Temps"]).fillna(0)
+    g["Temps_moyen_ligne"] = (g["Temps"] / g["Lignes"].replace(0, pd.NA)).fillna(0.0)
+    return g
+
+
+def apply_treemap_complexity_ticket_hover(fig: go.Figure) -> None:
+    """Infobulles : détail ticket/sujet/temps sur les feuilles ; agrégats = libellé + temps."""
+    tr = fig.data[0]
+    _trace_kw: dict = {
+        "texttemplate": "<b>%{label}</b><br>%{value:.0f} min",
+        "textfont": dict(size=10),
+    }
+    if tr.customdata is not None and tr.labels is not None and tr.values is not None:
+        _hts: list[str] = []
+        for i in range(len(tr.labels)):
+            cd = tr.customdata[i]
+            lab = tr.labels[i]
+            val = float(tr.values[i])
+            if cd is not None and len(cd) >= 3 and str(cd[0]) != "(?)":
+                _hts.append(
+                    f"<b>Ticket</b> {cd[0]}<br><b>Sujet</b> {cd[1]}<br><b>Temps</b> {float(cd[2]):.2f} min"
+                )
+            else:
+                _hts.append(f"<b>{html.escape(str(lab))}</b><br>Temps : {val:.1f} min")
+        _trace_kw["hovertext"] = _hts
+        _trace_kw["hovertemplate"] = "%{text}<extra></extra>"
+    fig.update_traces(**_trace_kw)
+
+
+def pareto_80_client_share(client_exec: pd.DataFrame) -> tuple[Optional[int], Optional[float]]:
+    """Nombre de clients (tri décroissant temps) pour atteindre 80 % du temps ; % du total de clients."""
+    if client_exec.empty:
+        return None, None
+    tot = float(client_exec["Temps_total_min"].sum())
+    if tot <= 0:
+        return None, None
+    s = client_exec.sort_values("Temps_total_min", ascending=False)
+    cum = s["Temps_total_min"].cumsum() / tot * 100.0
+    n = len(s)
+    for i, v in enumerate(cum.values):
+        if v >= 80:
+            n = i + 1
+            break
+    n_clients = len(s)
+    pct = 100.0 * n / n_clients if n_clients else 0.0
+    return n, pct
+
+
+def workload_minutes_by_weekday(
+    filtered: pd.DataFrame, date_cols: list[str], ref_year: Optional[int]
+) -> pd.DataFrame:
+    """Somme des minutes par jour de la semaine (colonnes jour → date)."""
+    if not date_cols or filtered.empty:
+        return pd.DataFrame(columns=["jour_sem", "ordre", "minutes"])
+    wd_fr = {
+        0: "Lundi",
+        1: "Mardi",
+        2: "Mercredi",
+        3: "Jeudi",
+        4: "Vendredi",
+        5: "Samedi",
+        6: "Dimanche",
+    }
+    acc: dict[int, float] = {i: 0.0 for i in range(7)}
+    for c in date_cols:
+        ts = parse_column_to_datetime(c, ref_year=ref_year)
+        if pd.isna(ts):
+            continue
+        w = int(ts.weekday())
+        acc[w] += float(pd.to_numeric(filtered[c], errors="coerce").fillna(0).sum())
+    rows = [{"ordre": i, "jour_sem": wd_fr[i], "minutes": acc[i]} for i in range(7)]
+    return pd.DataFrame(rows)
+
+
+def count_statut_closed_like(series: pd.Series) -> int:
+    """Heuristique : lignes dont le statut évoque une clôture / résolution."""
+    keys = (
+        "clos",
+        "closed",
+        "resolu",
+        "ferme",
+        "complete",
+        "termin",
+        "solved",
+    )
+    s = series.astype(str).str.lower()
+    return int(s.map(lambda x: any(k in x for k in keys)).sum())
 
 
 def parse_column_to_datetime(c, ref_year: Optional[int] = None) -> pd.Timestamp:
@@ -472,9 +788,9 @@ def period_bounds_from_ordered_cols(
 
 
 def interventions_for_date_subset(
-    df: pd.DataFrame, date_cols_subset: list[str], ticket_col: Optional[str]
+    df: pd.DataFrame, date_cols_subset: list[str]
 ) -> pd.Series:
-    """Tickets / lignes avec au moins une minute sur le sous-ensemble de colonnes."""
+    """Lignes avec au moins une minute sur le sous-ensemble de colonnes, par consultant."""
     if not date_cols_subset:
         return pd.Series(dtype=float)
     df2 = ensure_numeric_minutes(df, date_cols_subset)
@@ -482,13 +798,11 @@ def interventions_for_date_subset(
     sub = df2.loc[row_mask]
     if len(sub) == 0:
         return pd.Series(dtype=float)
-    if ticket_col and ticket_col in sub.columns:
-        return sub.groupby("Collaborateur", dropna=False)[ticket_col].nunique()
     return sub.groupby("Collaborateur", dropna=False).size()
 
 
 def kpi_table_for_date_cols(
-    filtered: pd.DataFrame, date_cols_subset: list[str], ticket_col: Optional[str]
+    filtered: pd.DataFrame, date_cols_subset: list[str]
 ) -> tuple[pd.DataFrame, float, int, float]:
     """KPI par consultant pour un sous-ensemble de colonnes jour."""
     if not date_cols_subset:
@@ -496,19 +810,15 @@ def kpi_table_for_date_cols(
         return kpi, 0.0, 0, 0.0
     df2 = ensure_numeric_minutes(filtered, date_cols_subset).copy()
     df2["_t"] = df2[date_cols_subset].sum(axis=1, numeric_only=True)
-    inter = interventions_for_date_subset(filtered, date_cols_subset, ticket_col)
+    inter = interventions_for_date_subset(filtered, date_cols_subset)
     tpc = df2.groupby("Collaborateur", dropna=False)["_t"].sum()
     inter = inter.reindex(tpc.index, fill_value=0)
-    kpi = pd.DataFrame({"Temps_total": tpc, "Interventions": inter})
-    kpi["Interventions"] = kpi["Interventions"].fillna(0).astype(int)
-    kpi["Temps_moyen_par_ticket"] = kpi["Temps_total"] / kpi["Interventions"].replace(0, pd.NA)
+    kpi = pd.DataFrame({"Temps_total": tpc, "Lignes": inter})
+    kpi["Lignes"] = kpi["Lignes"].fillna(0).astype(int)
+    kpi["Temps_moyen_par_ligne"] = kpi["Temps_total"] / kpi["Lignes"].replace(0, pd.NA)
     kpi = kpi.fillna(0)
     tot = float(df2["_t"].sum())
-    if ticket_col and ticket_col in filtered.columns:
-        sub = df2.loc[df2["_t"] > 0]
-        nb = int(sub[ticket_col].nunique()) if len(sub) else 0
-    else:
-        nb = int((df2["_t"] > 0).sum())
+    nb = int((df2["_t"] > 0).sum())
     moy = tot / nb if nb else 0.0
     return kpi, tot, nb, moy
 
@@ -534,6 +844,9 @@ def render_monthly_charts_streamlit(
     )
     pivot_display = pivot.reset_index()
     pivot_display["Mois"] = pivot_display["Mois"].map(ym_key_to_french_label)
+    _num = pivot_display.select_dtypes(include=["number"]).columns
+    if len(_num):
+        pivot_display[_num] = pivot_display[_num].round(2)
     st.dataframe(pivot_display, use_container_width=True, hide_index=True)
 
     m1, m2 = st.columns(2)
@@ -615,9 +928,15 @@ def render_year_detail_charts(
     ordered_y: list[str],
     ref_year: int,
     title: str,
-    ticket_col: Optional[str],
 ) -> None:
     """KPI, heatmap jour, lignes quotidiennes, cumul et analyse mensuelle pour un millésime."""
+    # Exclure ref_year / totaux : sinon une seule colonne « annuelle » écrase l’échelle des couleurs.
+    cols_y = [c for c in cols_y if not _is_reserved_data_column(str(c))]
+    ordered_y = order_date_columns(cols_y, ref_year=ref_year)
+    if not cols_y:
+        st.warning("Aucune colonne jour exploitable après exclusion des totaux / métadonnées.")
+        return
+
     st.markdown(f"### {title}")
     dt_a, dt_b = period_bounds_from_ordered_cols(ordered_y, ref_year=ref_year)
     if dt_a is not None and dt_b is not None:
@@ -626,28 +945,27 @@ def render_year_detail_charts(
             f"**{len(cols_y)}** jour(s) en colonnes · **{len(fy)}** ligne(s)"
         )
 
-    kpi_y, tot_y, nb_y, moy_y = kpi_table_for_date_cols(fy, cols_y, ticket_col)
+    kpi_y, tot_y, nb_y, moy_y = kpi_table_for_date_cols(fy, cols_y)
     if len(kpi_y) == 0:
         st.warning("Pas de données agrégées pour cette année.")
         return
 
     y1, y2, y3 = st.columns(3)
-    y1.metric("Temps (min)", f"{tot_y:,.0f}".replace(",", " "))
-    y2.metric("Tickets concernés", f"{nb_y:,}".replace(",", " "))
-    y3.metric("Temps moyen / ticket (min)", f"{moy_y:,.1f}".replace(",", " "))
+    y1.metric("Temps (min)", fmt_fr(tot_y))
+    y2.metric("Lignes (avec temps)", f"{nb_y:,}".replace(",", " "))
+    y3.metric("Temps moyen / ligne (min)", fmt_fr(moy_y))
 
-    st.dataframe(
-        kpi_y.reset_index().rename(
-            columns={
-                "Collaborateur": "Consultant",
-                "Temps_total": "Temps (min)",
-                "Interventions": "Tickets (avec temps cette année)",
-                "Temps_moyen_par_ticket": "Temps moyen / ticket (min)",
-            }
-        ),
-        use_container_width=True,
-        hide_index=True,
+    _kpi_show = kpi_y.reset_index().rename(
+        columns={
+            "Collaborateur": "Consultant",
+            "Temps_total": "Temps (min)",
+            "Lignes": "Lignes (avec temps cette année)",
+            "Temps_moyen_par_ligne": "Temps moyen / ligne (min)",
+        }
     )
+    _kpi_show["Temps (min)"] = _kpi_show["Temps (min)"].round(2)
+    _kpi_show["Temps moyen / ligne (min)"] = _kpi_show["Temps moyen / ligne (min)"].round(2)
+    st.dataframe(_kpi_show, use_container_width=True, hide_index=True)
 
     kr = kpi_y.reset_index().sort_values("Temps_total", ascending=True)
     fy_bar = px.bar(
@@ -855,7 +1173,6 @@ def save_session_pickle(
     session_name: str,
     df_num: pd.DataFrame,
     date_cols: list[str],
-    ticket_col: Optional[str],
     source_files: list[str],
 ) -> Path:
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", (session_name or "").strip())[:80]
@@ -864,7 +1181,6 @@ def save_session_pickle(
     payload = {
         "saved_at": pd.Timestamp.now().isoformat(),
         "source_files": source_files,
-        "ticket_col": ticket_col,
         "date_cols": date_cols,
         "df_num": df_num,
     }
@@ -889,7 +1205,7 @@ def build_report_html(
     df_filtered: pd.DataFrame,
     kpi_table: pd.DataFrame,
     temps_global: float,
-    nb_tickets_uniques: int,
+    nb_lignes: int,
     temps_moyen: float,
     fig_bar,
     fig_pie,
@@ -897,20 +1213,18 @@ def build_report_html(
     fig_tree,
     years_in_filtered: list[int],
     date_cols: list[str],
-    ticket_col: Optional[str],
 ) -> bytes:
-    kpi_html = (
-        kpi_table.reset_index()
-        .rename(
-            columns={
-                "Collaborateur": "Consultant",
-                "Temps_total": "Temps global (min)",
-                "Interventions": "Nb tickets",
-                "Temps_moyen_par_ticket": "Temps moyen / ticket (min)",
-            }
-        )
-        .to_html(index=False, escape=False)
+    _kpi_rpt = kpi_table.reset_index().rename(
+        columns={
+            "Collaborateur": "Consultant",
+            "Temps_total": "Temps global (min)",
+            "Lignes": "Lignes (export)",
+            "Temps_moyen_par_ligne": "Temps moyen / ligne (min)",
+        }
     )
+    _kpi_rpt["Temps global (min)"] = _kpi_rpt["Temps global (min)"].round(2)
+    _kpi_rpt["Temps moyen / ligne (min)"] = _kpi_rpt["Temps moyen / ligne (min)"].round(2)
+    kpi_html = _kpi_rpt.to_html(index=False, escape=False)
 
     parts: list[str] = []
     parts.append(
@@ -944,9 +1258,9 @@ def build_report_html(
   <h1>{title}</h1>
   <div class="meta">Généré le {pd.Timestamp.now().strftime("%d/%m/%Y %H:%M")} · Période sélectionnée : <b>{period_label}</b> · Lignes filtrées : <b>{len(df_filtered)}</b></div>
   <div class="kpis">
-    <div class="kpi"><div class="label">Temps global (min)</div><div class="value">{temps_global:,.0f}</div></div>
-    <div class="kpi"><div class="label">Tickets (uniques)</div><div class="value">{nb_tickets_uniques:,}</div></div>
-    <div class="kpi"><div class="label">Temps moyen / ticket (min)</div><div class="value">{temps_moyen:,.1f}</div></div>
+    <div class="kpi"><div class="label">Temps global (min)</div><div class="value">{fmt_fr(temps_global)}</div></div>
+    <div class="kpi"><div class="label">Lignes (export)</div><div class="value">{nb_lignes:,}</div></div>
+    <div class="kpi"><div class="label">Temps moyen / ligne (min)</div><div class="value">{fmt_fr(temps_moyen)}</div></div>
     <div class="kpi"><div class="label">Années (noms de fichiers)</div><div class="value">{len(years_in_filtered) if years_in_filtered else 0}</div></div>
   </div>
 """
@@ -954,7 +1268,7 @@ def build_report_html(
     parts.append('<div class="block"><h2>Table KPI (consultants)</h2>' + kpi_html + "</div>")
 
     parts.append('<div class="block"><h2>Répartition du temps (global)</h2>')
-    parts.append('<div class="caption">Barres, camembert, et comparaison temps total vs temps moyen par ticket.</div>')
+    parts.append('<div class="caption">Barres, camembert, et comparaison temps total vs temps moyen par ligne.</div>')
     parts.append(fig_to_html(fig_bar))
     parts.append(fig_to_html(fig_pie))
     parts.append(fig_to_html(fig_grouped))
@@ -995,23 +1309,38 @@ def build_report_html(
     return html.encode("utf-8")
 
 
-def load_uploaded_file(uploaded) -> pd.DataFrame:
-    name = uploaded.name.lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(uploaded)
-    if name.endswith(".xls") and not name.endswith(".xlsx"):
+def _load_uploaded_file_bytes(name: str, content: bytes) -> pd.DataFrame:
+    """Lit un export depuis des octets (CSV / Excel)."""
+    name_l = name.lower()
+    buf = io.BytesIO(content)
+    if name_l.endswith(".csv"):
         try:
-            return pd.read_excel(uploaded, engine="xlrd")
+            return pd.read_csv(buf, engine="pyarrow")
         except Exception:
-            pass
-    return pd.read_excel(uploaded, engine="openpyxl")
+            buf.seek(0)
+            return pd.read_csv(buf, low_memory=False)
+    if name_l.endswith(".xls") and not name_l.endswith(".xlsx"):
+        try:
+            return pd.read_excel(buf, engine="xlrd")
+        except Exception:
+            buf.seek(0)
+            return pd.read_excel(buf, engine="openpyxl")
+    return pd.read_excel(buf, engine="openpyxl")
+
+
+@st.cache_data(show_spinner="Lecture des fichiers…", max_entries=64)
+def _load_uploaded_file_cached(name: str, content_sha256: str, content: bytes) -> pd.DataFrame:
+    """Cache par (nom + hash) : les reruns Streamlit ne relisent pas Excel/CSV."""
+    return _load_uploaded_file_bytes(name, content)
 
 
 def normalize_and_concat(uploaded_list: list) -> pd.DataFrame:
     """Charge plusieurs fichiers et les empile (même schéma attendu ; colonnes réunies si besoin)."""
     frames = []
     for up in uploaded_list:
-        df = load_uploaded_file(up)
+        raw_bytes = up.getvalue()
+        h = hashlib.sha256(raw_bytes).hexdigest()
+        df = _load_uploaded_file_cached(up.name, h, raw_bytes)
         df["_Fichier_source"] = up.name
         y = extract_year_from_filenames([up.name])
         df["__ref_year"] = y if y is not None else pd.NA
@@ -1142,7 +1471,6 @@ if "Statut" not in df.columns and "Status" in df.columns:
 if "Statut" not in df.columns:
     df["Statut"] = "—"
 
-ticket_col = detect_ticket_column(df)
 date_cols = detect_date_columns(df)
 df_num = ensure_numeric_minutes(df, date_cols)
 df_num["Total_Temps_Ticket"] = build_total_temps(df_num, date_cols)
@@ -1156,7 +1484,6 @@ if st.sidebar.button("Sauvegarder (sur disque)"):
             _session_name,
             df_num=df_num,
             date_cols=date_cols,
-            ticket_col=ticket_col,
             source_files=_source_files,
         )
         st.sidebar.success(f"Session sauvegardée : {p.name}")
@@ -1217,27 +1544,75 @@ sel_collab = st.sidebar.multiselect("Collaborateur", options=collab_opts, defaul
 sel_client = st.sidebar.multiselect("Client", options=client_opts, default=client_opts)
 sel_statut = st.sidebar.multiselect("Statut du ticket", options=statut_opts, default=statut_opts)
 
+st.sidebar.divider()
+with st.sidebar.expander("Score de complexité (méthode)"):
+    st.markdown(
+        """
+**Catégories** (mots-clés dans la colonne *Sujet*, sans tenir compte de la casse) :
+
+- **ADMIN-ACCES** : mdp, session, connexion, accès, identifiant, profil, création, cession, utilisateur, mot de passe, inacessible / inaccessible  
+- **PARAM** : paramétrage, cycle, règle, bdese, mutation, badge, badgeuse, calcul, analytique, pointage  
+- **TECH** : erreur, fichier, extraction, rejet, bug, anomalie, système, intégration, impossibilité, impossible  
+- **AUTRE** : tout le reste (ou absence de colonne sujet)
+
+**Score** = `Temps (min) × coefficient`, avec **ADMIN=1**, **PARAM=2**, **TECH=3**, **AUTRE=1**.
+
+Sur le treemap **synthèse** (catégorie × consultant), la couleur représente le **temps moyen par ligne** (des tickets plus longs en moyenne apparaissent plus « chauds »). Sur le **détail tickets**, la couleur utilise le **score** `Temps × coefficient`.
+        """
+    )
+
+heures_presence = st.sidebar.number_input(
+    "Heures de présence équipe (période, optionnel)",
+    min_value=0.0,
+    value=0.0,
+    step=1.0,
+    help="Saisissez le volume d’heures travaillées sur la période pour estimer un ratio "
+    "« lignes à statut clôturé / résolu » par heure (approximatif).",
+)
+
+subject_col = detect_subject_column(df_num)
+ticket_col = detect_ticket_column(df_num)
 filtered = df_num[
     _mask_period
     & df_num["Collaborateur"].astype(str).isin(sel_collab)
     & df_num["Client"].astype(str).isin(sel_client)
     & df_num["Statut"].astype(str).isin(sel_statut)
 ].copy()
+filtered = enrich_complexity_columns(filtered, subject_col)
 
-interventions = interventions_par_collaborateur(filtered, ticket_col)
+interventions = interventions_par_collaborateur(filtered)
 temps_par_collab = filtered.groupby("Collaborateur", dropna=False)["Total_Temps_Ticket"].sum()
-kpi_table = pd.DataFrame({"Temps_total": temps_par_collab, "Interventions": interventions})
-kpi_table["Temps_moyen_par_ticket"] = kpi_table["Temps_total"] / kpi_table["Interventions"].replace(
-    0, pd.NA
-)
+med_par_ligne = filtered.groupby("Collaborateur", dropna=False)["Total_Temps_Ticket"].median()
+kpi_table = pd.DataFrame({"Temps_total": temps_par_collab, "Lignes": interventions})
+kpi_table["Temps_mediane_ligne"] = med_par_ligne.reindex(kpi_table.index).fillna(0)
+kpi_table["Temps_moyen_par_ligne"] = kpi_table["Temps_total"] / kpi_table["Lignes"].replace(0, pd.NA)
 kpi_table = kpi_table.fillna(0)
 
 temps_global = float(filtered["Total_Temps_Ticket"].sum())
-if ticket_col and ticket_col in filtered.columns:
-    nb_tickets_uniques = int(filtered[ticket_col].nunique())
-else:
-    nb_tickets_uniques = len(filtered)
-temps_moyen = temps_global / nb_tickets_uniques if nb_tickets_uniques else 0.0
+nb_lignes = len(filtered)
+temps_moyen = temps_global / nb_lignes if nb_lignes else 0.0
+temps_mediane_ligne_global = float(filtered["Total_Temps_Ticket"].median()) if nb_lignes else 0.0
+
+client_exec = build_client_executive_table(filtered)
+n_clients_pareto80, pct_clients_pareto80 = pareto_80_client_share(client_exec)
+nb_lignes_closed = count_statut_closed_like(filtered["Statut"]) if "Statut" in filtered.columns else 0
+ratio_closed_par_h = (nb_lignes_closed / heures_presence) if heures_presence > 0 else None
+
+var_n1_pct: Optional[float] = None
+_yref = None
+if "__ref_year" in filtered.columns and len(filtered["__ref_year"].dropna()):
+    yt = filtered.groupby("__ref_year", dropna=False)["Total_Temps_Ticket"].sum()
+    _years_sorted = sorted(int(y) for y in yt.index if pd.notna(y))
+    if len(_years_sorted) >= 2:
+        y_max = _years_sorted[-1]
+        y_prev = y_max - 1
+        yt_by_year = {int(k): float(v) for k, v in yt.items()}
+        if y_max in yt_by_year and y_prev in yt_by_year:
+            t_y = yt_by_year[y_max]
+            t_y1 = yt_by_year[y_prev]
+            if t_y1 > 0:
+                var_n1_pct = 100.0 * (t_y - t_y1) / t_y1
+                _yref = (y_max, y_prev)
 
 _years_in_filtered = (
     sorted({int(y) for y in filtered["__ref_year"].dropna().unique()})
@@ -1245,6 +1620,10 @@ _years_in_filtered = (
     else []
 )
 dt_min, dt_max = period_bounds_from_ordered_cols(ordered_date_cols, REF_YEAR)
+
+if len(kpi_table) == 0:
+    st.warning("Aucune donnée avec les filtres actuels.")
+    st.stop()
 
 # --- Vue globale (récapitulatif) ---
 st.subheader("Vue globale — récapitulatif")
@@ -1260,30 +1639,382 @@ else:
     )
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Temps global (min)", f"{temps_global:,.0f}".replace(",", " "))
-c2.metric("Tickets (uniques)", f"{nb_tickets_uniques:,}".replace(",", " "))
-c3.metric("Temps moyen / ticket (min)", f"{temps_moyen:,.1f}".replace(",", " "))
+c1.metric("Temps global (min)", fmt_fr(temps_global))
+c2.metric("Lignes (export)", f"{nb_lignes:,}".replace(",", " "))
+c3.metric("Temps moyen / ligne (min)", fmt_fr(temps_moyen))
 c4.metric(
     "Années (noms de fichiers)",
     str(len(_years_avail)) if _years_avail else ("1" if _period_sel != "Toutes les années" else "—"),
 )
 
-st.dataframe(
-    kpi_table.reset_index().rename(
-        columns={
-            "Collaborateur": "Consultant",
-            "Temps_total": "Temps global (min)",
-            "Interventions": "Nb tickets",
-            "Temps_moyen_par_ticket": "Temps moyen / ticket (min)",
-        }
-    ),
-    use_container_width=True,
-    hide_index=True,
+_kpi_global = kpi_table.reset_index().rename(
+    columns={
+        "Collaborateur": "Consultant",
+        "Temps_total": "Temps global (min)",
+        "Lignes": "Lignes (export)",
+        "Temps_mediane_ligne": "Temps médiane / ligne (min)",
+        "Temps_moyen_par_ligne": "Temps moyen / ligne (min)",
+    }
+)
+_kpi_global["Temps global (min)"] = _kpi_global["Temps global (min)"].round(2)
+_kpi_global["Temps médiane / ligne (min)"] = _kpi_global["Temps médiane / ligne (min)"].round(2)
+_kpi_global["Temps moyen / ligne (min)"] = _kpi_global["Temps moyen / ligne (min)"].round(2)
+st.dataframe(_kpi_global, use_container_width=True, hide_index=True)
+
+e1, e2, e3, e4 = st.columns(4)
+e1.metric("Temps médian / ligne (global)", fmt_fr(temps_mediane_ligne_global))
+if n_clients_pareto80 is not None and pct_clients_pareto80 is not None:
+    e2.metric(
+        "Pareto 80 % — concentration client",
+        f"{n_clients_pareto80} clients",
+        delta=f"{pct_clients_pareto80:.1f} % des clients pour 80 % du temps",
+    )
+else:
+    e2.metric("Pareto 80 %", "—")
+if var_n1_pct is not None and _yref is not None:
+    e3.metric(
+        f"Activité vs {_yref[1]} (année {_yref[0]})",
+        f"{var_n1_pct:+.2f} %",
+        delta="temps total (sélection)",
+    )
+else:
+    e3.metric("Comparaison N-1", "—")
+if ratio_closed_par_h is not None:
+    e4.metric(
+        "Lignes statut « clôturé » / heure",
+        f"{ratio_closed_par_h:.2f} / h",
+        delta=f"{nb_lignes_closed} lignes (heuristique) / {heures_presence:.1f} h",
+    )
+else:
+    e4.metric("Lignes « clôturé » / heure", "—")
+
+st.markdown("##### Treemap — complexité (catégorie × consultant)")
+st.caption(
+    "Taille = temps total (min). **Couleur = temps moyen par ligne** : RdYlGn_r (rouge = tickets plus longs en moyenne). "
+    "L’échelle de couleur est **bornée au 90e percentile** lorsqu’un résidu (ex. une moyenne ~600 min) écrase le reste — "
+    "la **valeur exacte** reste dans l’infobulle. Détail tickets ci-dessous au choix."
+)
+if len(filtered) and "Categorie" in filtered.columns:
+    _ov = build_complexity_treemap_overview(filtered)
+    if len(_ov):
+        fig_cat = px.treemap(
+            _ov,
+            path=["Categorie", "Collaborateur"],
+            values="Temps",
+            color="Temps_moyen_ligne",
+            color_continuous_scale="RdYlGn_r",
+            labels={
+                "Temps": "Minutes (total)",
+                "Temps_moyen_ligne": "Temps moyen / ligne (min)",
+                "Score_moy": "Coef. moyen (pondéré)",
+            },
+            title="Répartition du temps par catégorie et consultant",
+            hover_data={
+                "Score_moy": ":.2f",
+                "Temps_moyen_ligne": ":.1f",
+                "Lignes": True,
+            },
+        )
+        fig_cat.update_traces(
+            texttemplate="<b>%{label}</b><br>%{value:.0f} min",
+            textfont=dict(size=11),
+        )
+        _lay_cat: dict = dict(
+            template="plotly_dark",
+            paper_bgcolor="#0e1117",
+            font=dict(color="#e6edf3"),
+            margin=dict(l=8, r=8, t=48, b=8),
+        )
+        _cap_tml = coloraxis_upper_for_outliers(_ov["Temps_moyen_ligne"], q=0.90)
+        if _cap_tml is not None:
+            _lay_cat["coloraxis"] = dict(
+                cmin=0,
+                cmax=_cap_tml,
+                colorbar=dict(
+                    title=dict(
+                        text=f"Temps moy. / ligne (min)<br><sup>max affiché ≈ {_cap_tml:.0f} (P90)</sup>",
+                    )
+                ),
+            )
+        fig_cat.update_layout(**_lay_cat)
+        st.plotly_chart(fig_cat, use_container_width=True)
+
+        _seen_pairs: set[tuple[str, str]] = set()
+        _pair_list: list[tuple[str, str]] = []
+        for _, _r in _ov.iterrows():
+            _p = (str(_r["Categorie"]), str(_r["Collaborateur"]))
+            if _p not in _seen_pairs:
+                _seen_pairs.add(_p)
+                _pair_list.append(_p)
+        _detail_choice = st.selectbox(
+            "Détail des tickets (consultant)",
+            options=[None] + _pair_list,
+            format_func=lambda x: "—" if x is None else f"{x[0]} — {x[1]}",
+            key="treemap_ticket_detail_pair",
+            help="Équivalent à « zoomer » sur un consultant : les tickets s’affichent uniquement ici.",
+        )
+        if _detail_choice is not None:
+            _dcat, _dcollab = _detail_choice
+            _sub = filtered[
+                (filtered["Categorie"].astype(str) == _dcat)
+                & (filtered["Collaborateur"].astype(str) == _dcollab)
+            ]
+            _tix = build_complexity_treemap_hierarchy(_sub, subject_col, ticket_col)
+            if len(_tix):
+                _tg = _tix.copy()
+                _tg["Score_Complexite"] = _tg["SC"]
+                _tg["tid_h"] = _tg["_tid"].astype(str).map(html.escape)
+                _tg["sujet_h"] = _tg["_sujet"].map(lambda s: html.escape(str(s)))
+                fig_tix = px.treemap(
+                    _tg,
+                    path=["Ticket_label"],
+                    values="Temps",
+                    color="Score_Complexite",
+                    color_continuous_scale="RdYlGn_r",
+                    labels={"Temps": "Minutes", "Score_Complexite": "Score (min × coef.)"},
+                    title=f"Tickets — {_dcat} — {_dcollab}",
+                    custom_data=["tid_h", "sujet_h", "Temps"],
+                )
+                apply_treemap_complexity_ticket_hover(fig_tix)
+                _lay_tix: dict = dict(
+                    template="plotly_dark",
+                    paper_bgcolor="#0e1117",
+                    font=dict(color="#e6edf3"),
+                    margin=dict(l=8, r=8, t=48, b=8),
+                    height=520,
+                )
+                _cap_sc = coloraxis_upper_for_outliers(_tg["Score_Complexite"], q=0.90)
+                if _cap_sc is not None:
+                    _lay_tix["coloraxis"] = dict(
+                        cmin=0,
+                        cmax=_cap_sc,
+                        colorbar=dict(
+                            title=dict(
+                                text=f"Score (min×coef.)<br><sup>max affiché ≈ {_cap_sc:.0f} (P90)</sup>",
+                            )
+                        ),
+                    )
+                fig_tix.update_layout(**_lay_tix)
+                st.plotly_chart(fig_tix, use_container_width=True)
+            else:
+                st.caption("Aucun ticket à afficher pour cette sélection.")
+    else:
+        st.info("Pas de temps par catégorie à afficher.")
+else:
+    st.info("Données insuffisantes pour le treemap de complexité.")
+
+_dcols_wd = [c for c in date_cols if not _is_reserved_data_column(str(c))]
+st.markdown("##### Charge par jour de la semaine (somme des minutes)")
+wd_df = workload_minutes_by_weekday(filtered, _dcols_wd, REF_YEAR)
+if len(wd_df) and wd_df["minutes"].sum() > 0:
+    fig_wd = px.bar(
+        wd_df,
+        x="jour_sem",
+        y="minutes",
+        category_orders={"jour_sem": list(wd_df["jour_sem"])},
+        labels={"minutes": "Minutes (cumul)", "jour_sem": "Jour"},
+        title="Répartition des minutes par jour de la semaine (tous consultants)",
+        color="minutes",
+        color_continuous_scale="Viridis",
+    )
+    fig_wd.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="#0e1117",
+        plot_bgcolor="#161b22",
+        font=dict(color="#e6edf3"),
+        showlegend=False,
+        height=380,
+        margin=dict(l=8, r=8, t=48, b=8),
+    )
+    st.plotly_chart(fig_wd, use_container_width=True)
+    st.caption("Chaque colonne-jour du fichier est rattachée à un jour calendaire ; les minutes sont sommées par jour de la semaine (Lundi–Dimanche).")
+else:
+    st.caption("Pas assez de colonnes jour datées pour la répartition hebdomadaire.")
+
+if len(client_exec) and client_exec["Temps_total_min"].sum() > 0:
+    st.markdown("##### Courbe de Pareto — part cumulée du temps (clients)")
+    _ce = client_exec.sort_values("Temps_total_min", ascending=False)
+    _tot_c = float(_ce["Temps_total_min"].sum())
+    _cum = (_ce["Temps_total_min"].cumsum() / _tot_c * 100.0).reset_index(drop=True)
+    _x = list(range(1, len(_cum) + 1))
+    fig_p80 = go.Figure()
+    fig_p80.add_trace(
+        go.Scatter(
+            x=_x,
+            y=_cum.values,
+            mode="lines+markers",
+            name="Part cumulée (%)",
+            line=dict(color="#58a6ff", width=2),
+            marker=dict(size=5),
+        )
+    )
+    fig_p80.add_hline(y=80, line_dash="dash", line_color="#f85149", annotation_text="80 %")
+    fig_p80.update_layout(
+        title="Nombre de clients vs part cumulée du temps (le point sur la ligne rouge ≈ règle des 80 %)",
+        template="plotly_dark",
+        paper_bgcolor="#0e1117",
+        plot_bgcolor="#161b22",
+        font=dict(color="#e6edf3"),
+        xaxis_title="Rang du client (du plus chargé au moins chargé)",
+        yaxis_title="Part cumulée du temps (%)",
+        height=400,
+        margin=dict(l=8, r=8, t=56, b=8),
+    )
+    st.plotly_chart(fig_p80, use_container_width=True)
+
+st.markdown("---")
+
+# --- Synthèse direction (clients, charge, concentration) ---
+st.subheader("Synthèse direction — clients & charge")
+st.caption(
+    "Indicateurs calculés sur la **sélection actuelle** (période, filtres client / consultant / statut). "
+    "Les parts se rapportent au volume de temps total de cette sélection."
 )
 
-if len(kpi_table) == 0:
-    st.warning("Aucune donnée avec les filtres actuels.")
-    st.stop()
+if client_exec.empty or temps_global <= 0:
+    st.info("Pas assez de temps enregistré pour une analyse par client.")
+else:
+    n_clients_total = len(client_exec)
+    n_clients_actifs = int((client_exec["Temps_total_min"] > 0).sum())
+    top3_share = float(client_exec.head(3)["Part_temps_pct"].sum()) if n_clients_actifs else 0.0
+    top5_share = float(client_exec.head(5)["Part_temps_pct"].sum()) if n_clients_actifs else 0.0
+    client_sans_nom = int((client_exec.index.astype(str).str.strip().isin(("—", "-", ""))).sum())
+
+    d1, d2, d3, d4, d5 = st.columns(5)
+    d1.metric("Clients distincts", f"{n_clients_total:,}".replace(",", " "))
+    d2.metric("Clients avec temps > 0", f"{n_clients_actifs:,}".replace(",", " "))
+    d3.metric("Part du temps — Top 3 clients", f"{top3_share:.2f} %")
+    d4.metric("Part du temps — Top 5 clients", f"{top5_share:.2f} %")
+    d5.metric("Consultants (sélection)", f"{len(kpi_table):,}".replace(",", " "))
+
+    if client_sans_nom:
+        st.caption(
+            f"**{client_sans_nom}** entrée(s) sans organisation (libellé « — ») : regroupez-les dans Zendesk pour un pilotage plus fin."
+        )
+
+    top_n_dir = st.slider("Afficher le Top N clients (table & graphiques)", 5, 50, 15, 1)
+    head_cli = client_exec.head(top_n_dir).reset_index()
+    disp_cli = head_cli.rename(
+        columns={
+            "Rang": "Rang",
+            "Temps_total_min": "Temps total (min)",
+            "Nb_lignes": "Lignes (export)",
+            "Temps_moyen_par_ligne": "Temps moyen / ligne (min)",
+            "Part_temps_pct": "Part du temps (%)",
+            "Part_cumul_pct": "Part cumulée (%)",
+        }
+    )
+    st.markdown("##### Classement des clients les plus demandants (par temps total)")
+    st.dataframe(
+        disp_cli.round(
+            {
+                "Temps total (min)": 2,
+                "Lignes (export)": 0,
+                "Temps moyen / ligne (min)": 2,
+                "Part du temps (%)": 2,
+                "Part cumulée (%)": 2,
+            }
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.caption("Une **ligne** = une ligne Excel du fichier (pas d’identifiant ticket dans les exports).")
+
+    _csv_cli = client_exec.reset_index().drop(columns=["Rang"], errors="ignore")
+    for _c in ("Temps_total_min", "Temps_moyen_par_ligne", "Part_temps_pct", "Part_cumul_pct"):
+        if _c in _csv_cli.columns:
+            _csv_cli[_c] = _csv_cli[_c].round(2)
+    csv_clients = _csv_cli.to_csv(sep=";", decimal=",", encoding="utf-8-sig", index=False)
+    st.download_button(
+        "Télécharger le classement complet clients (CSV)",
+        data=csv_clients.encode("utf-8-sig"),
+        file_name=f"synthese_clients_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv",
+    )
+
+    fc1, fc2 = st.columns(2)
+    fig_cli_temps = px.bar(
+        head_cli.sort_values("Temps_total_min", ascending=True),
+        x="Temps_total_min",
+        y="Client",
+        orientation="h",
+        color="Temps_total_min",
+        color_continuous_scale="Reds",
+        labels={"Temps_total_min": "Minutes", "Client": ""},
+        title=f"Top {top_n_dir} — temps total (min)",
+    )
+    fig_cli_temps.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="#0e1117",
+        plot_bgcolor="#161b22",
+        font=dict(color="#e6edf3"),
+        showlegend=False,
+        yaxis=dict(categoryorder="total ascending"),
+        height=max(360, 28 * len(head_cli)),
+        margin=dict(l=8, r=8, t=48, b=8),
+    )
+    fig_cli_tickets = px.bar(
+        head_cli.sort_values("Nb_lignes", ascending=True),
+        x="Nb_lignes",
+        y="Client",
+        orientation="h",
+        color="Nb_lignes",
+        color_continuous_scale="Blues",
+        labels={"Nb_lignes": "Lignes", "Client": ""},
+        title=f"Top {top_n_dir} — nombre de lignes (export)",
+    )
+    fig_cli_tickets.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="#0e1117",
+        plot_bgcolor="#161b22",
+        font=dict(color="#e6edf3"),
+        showlegend=False,
+        yaxis=dict(categoryorder="total ascending"),
+        height=max(360, 28 * len(head_cli)),
+        margin=dict(l=8, r=8, t=48, b=8),
+    )
+    fc1.plotly_chart(fig_cli_temps, use_container_width=True)
+    fc2.plotly_chart(fig_cli_tickets, use_container_width=True)
+
+    fig_pareto = go.Figure()
+    csub = client_exec[client_exec["Temps_total_min"] > 0].head(25).copy()
+    if len(csub):
+        fig_pareto.add_trace(
+            go.Bar(
+                x=csub.index.astype(str),
+                y=csub["Part_temps_pct"],
+                name="Part du temps (%)",
+                marker_color="#f85149",
+            )
+        )
+        fig_pareto.add_trace(
+            go.Scatter(
+                x=csub.index.astype(str),
+                y=csub["Part_cumul_pct"],
+                name="Part cumulée (%)",
+                yaxis="y2",
+                mode="lines+markers",
+                line=dict(color="#58a6ff", width=2),
+                marker=dict(size=6),
+            )
+        )
+        _ymax = max(5.0, float(csub["Part_temps_pct"].max()) * 1.15)
+        fig_pareto.update_layout(
+            title="Concentration de la charge — 25 premiers clients (parts & cumul)",
+            template="plotly_dark",
+            paper_bgcolor="#0e1117",
+            plot_bgcolor="#161b22",
+            font=dict(color="#e6edf3"),
+            xaxis=dict(title="Client", tickangle=-45),
+            yaxis=dict(title="Part du temps (%)", side="left", range=[0, min(100.0, _ymax)]),
+            yaxis2=dict(title="Part cumulée (%)", overlaying="y", side="right", range=[0, 105], showgrid=False),
+            height=460,
+            margin=dict(l=8, r=60, t=56, b=120),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        st.plotly_chart(fig_pareto, use_container_width=True)
+
+st.markdown("---")
 
 # --- Comparaison consultants (vue globale) ---
 st.subheader("Vue globale — répartition du temps")
@@ -1334,7 +2065,7 @@ cbar, cpie = st.columns([1.2, 1])
 cbar.plotly_chart(fig_bar, use_container_width=True)
 cpie.plotly_chart(fig_pie, use_container_width=True)
 
-# Grouped metrics : temps vs moyenne par ticket
+# Grouped metrics : temps vs moyenne par ligne
 comp = kpi_reset.sort_values("Temps_total", ascending=False)
 fig_grouped = go.Figure()
 fig_grouped.add_trace(
@@ -1348,15 +2079,15 @@ fig_grouped.add_trace(
 )
 fig_grouped.add_trace(
     go.Bar(
-        name="Temps moyen / ticket (min)",
+        name="Temps moyen / ligne (min)",
         x=comp["Collaborateur"],
-        y=comp["Temps_moyen_par_ticket"],
+        y=comp["Temps_moyen_par_ligne"],
         marker_color="#58a6ff",
         offsetgroup=2,
     )
 )
 fig_grouped.update_layout(
-    title="Comparaison directe : temps total vs temps moyen par ticket",
+    title="Comparaison directe : temps total vs temps moyen par ligne",
     template="plotly_dark",
     paper_bgcolor="#0e1117",
     plot_bgcolor="#161b22",
@@ -1405,7 +2136,7 @@ _report_bytes = build_report_html(
     df_filtered=filtered,
     kpi_table=kpi_table,
     temps_global=temps_global,
-    nb_tickets_uniques=nb_tickets_uniques,
+    nb_lignes=nb_lignes,
     temps_moyen=temps_moyen,
     fig_bar=fig_bar,
     fig_pie=fig_pie,
@@ -1413,7 +2144,6 @@ _report_bytes = build_report_html(
     fig_tree=fig_tree,
     years_in_filtered=_years_in_filtered,
     date_cols=date_cols,
-    ticket_col=ticket_col,
 )
 st.download_button(
     "Télécharger le rapport (HTML)",
@@ -1448,7 +2178,6 @@ else:
             ordered_y,
             ref_year=_year,
             title=f"Année fichier {_year}",
-            ticket_col=ticket_col,
         )
 
 with st.expander("Détail technique (colonnes / exclusions)"):
@@ -1456,7 +2185,7 @@ with st.expander("Détail technique (colonnes / exclusions)"):
         "Colonnes « Total » dans les **en-têtes** : ignorées pour le calcul. "
         "Lignes dont le **consultant** ressemble à Total / Sum / Somme : exclues."
     )
-    st.write("Fichiers :", [f.name for f in uploaded_list])
+    st.write("Fichiers :", [f.name for f in uploaded_list] if uploaded_list else _source_files)
     st.write("Colonnes jour (minutes) :", date_cols or "—")
-    st.write("Colonne ticket :", ticket_col or "— (une ligne = une intervention)")
+    st.write("Lignes d’export : une ligne = une ligne du fichier (pas de n° ticket dans les XLS).")
     st.write("Lignes exclues (Total/Sum) :", n_rows_aggregate)
